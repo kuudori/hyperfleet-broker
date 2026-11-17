@@ -25,6 +25,7 @@ import (
 var (
 	sharedRabbitMQURL     string
 	sharedPubSubProjectID string
+	sharedPostgresDSN     string
 )
 
 // TestMain sets up the test environment, creates shared RabbitMQ and PubSub containers,
@@ -97,10 +98,41 @@ func TestMain(m *testing.M) {
 	}
 
 	emulatorHost := fmt.Sprintf("%s:%s", host, mappedPort.Port())
-	if err := os.Setenv("PUBSUB_EMULATOR_HOST", emulatorHost); err != nil {
+	if setenvErr := os.Setenv("PUBSUB_EMULATOR_HOST", emulatorHost); setenvErr != nil {
 		_ = rabbitmqContainer.Terminate(ctx)
 		_ = pubsubContainer.Terminate(ctx)
-		fmt.Fprintf(os.Stderr, "failed to set PUBSUB_EMULATOR_HOST: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to set PUBSUB_EMULATOR_HOST: %v\n", setenvErr)
+		os.Exit(1)
+	}
+
+	var startErr error
+	var postgresContainer testcontainers.Container
+	postgresRequest := testcontainers.ContainerRequest{
+		Image:        "postgres:16-alpine",
+		ExposedPorts: []string{"5432/tcp"},
+		Env: map[string]string{
+			"POSTGRES_USER":             "broker",
+			"POSTGRES_PASSWORD":         "broker",
+			"POSTGRES_DB":               "broker",
+			"POSTGRES_HOST_AUTH_METHOD": "trust",
+		},
+		WaitingFor: wait.ForLog("database system is ready to accept connections").
+			WithOccurrence(2).
+			WithStartupTimeout(60 * time.Second),
+	}
+	postgresContainer, sharedPostgresDSN, startErr = testutil.StartPostgresContainer(ctx, postgresRequest)
+	if startErr != nil {
+		_ = rabbitmqContainer.Terminate(ctx) // best-effort cleanup; the process exits below
+		_ = pubsubContainer.Terminate(ctx)   // best-effort cleanup; the process exits below
+		fmt.Fprintf(os.Stderr, "failed to start postgres backend: %v\n", startErr)
+		os.Exit(1)
+	}
+
+	if pgErr := testutil.ApplyEventLogSchema(ctx, sharedPostgresDSN); pgErr != nil {
+		_ = postgresContainer.Terminate(ctx) // best-effort cleanup; the process exits below
+		_ = rabbitmqContainer.Terminate(ctx) // best-effort cleanup; the process exits below
+		_ = pubsubContainer.Terminate(ctx)   // best-effort cleanup; the process exits below
+		fmt.Fprintf(os.Stderr, "failed to apply event log schema: %v\n", pgErr)
 		os.Exit(1)
 	}
 
@@ -112,6 +144,9 @@ func TestMain(m *testing.M) {
 	}
 	if err := pubsubContainer.Terminate(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to terminate pubsub container: %v\n", err)
+	}
+	if err := postgresContainer.Terminate(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to terminate postgres container: %v\n", err)
 	}
 
 	os.Exit(code)
@@ -138,6 +173,8 @@ func setupBrokerTest(t *testing.T, cfg brokerTestConfig) map[string]string {
 		configMap = testutil.BuildConfigMap("rabbitmq", sharedRabbitMQURL, "")
 	case "googlepubsub":
 		configMap = testutil.BuildConfigMap("googlepubsub", "", sharedPubSubProjectID)
+	case "postgres":
+		configMap = testutil.BuildPostgresConfigMap(sharedPostgresDSN)
 	default:
 		t.Fatalf("unsupported broker type: %s", cfg.brokerType)
 	}
@@ -267,6 +304,15 @@ func TestGooglePubSubGoroutineLeak(t *testing.T) {
 	})
 }
 
+// TestPostgresGoroutineLeak tests goroutine leak with the postgres backend
+func TestPostgresGoroutineLeak(t *testing.T) {
+	testGoroutineLeak(t, brokerTestConfig{
+		brokerType:     "postgres",
+		setupSleep:     500 * time.Millisecond,
+		receiveTimeout: 5 * time.Second,
+	})
+}
+
 func testLeakIncreasesWithUsage(t *testing.T, cfg brokerTestConfig) {
 	t.Log("=== Verify goroutine count stays within tolerance as subscriptions grow ===")
 	t.Log("")
@@ -293,22 +339,30 @@ func testLeakIncreasesWithUsage(t *testing.T, cfg brokerTestConfig) {
 			sub, err := broker.NewSubscriber(testutil.NewTestLogger(), "leak-demo", testutil.NewTestMetrics(t), configMap)
 			require.NoError(t, err)
 
+			// Registered before subscribing so a failed Subscribe still
+			// tears the subscriber down; the explicit close before the
+			// measurement runs it exactly once.
+			var closeOnce sync.Once
+			closeSub := func() {
+				closeOnce.Do(func() {
+					if err := sub.Close(); err != nil {
+						t.Logf("failed to close subscriber: %v", err)
+					}
+				})
+			}
+			t.Cleanup(closeSub)
+
 			ctx := context.Background()
 
 			// Subscribe N times
 			for i := 0; i < tc.numSubscriptions; i++ {
-				if err := sub.Subscribe(ctx, fmt.Sprintf("topic-%d", i), handler); err != nil {
-					t.Logf("failed to subscribe to topic-%d: %v", i, err)
-				}
+				require.NoError(t, sub.Subscribe(ctx, fmt.Sprintf("topic-%d", i), handler))
 			}
 			time.Sleep(cfg.setupSleep)
 
 			during := runtime.NumGoroutine()
 
-			// Close
-			if err := sub.Close(); err != nil {
-				t.Logf("failed to close subscriber: %v", err)
-			}
+			closeSub()
 			waitForGC()
 
 			after := runtime.NumGoroutine()
@@ -344,6 +398,15 @@ func TestGooglePubSubLeakIncreasesWithUsage(t *testing.T) {
 		// for retries and the gRPC client may leave goroutines that take time to terminate.
 		// Allow a small tolerance per subscription.
 		leakTolerance: 4,
+	})
+}
+
+// TestPostgresLeakIncreasesWithUsage verifies goroutine cleanup scales with topic count using the postgres backend
+func TestPostgresLeakIncreasesWithUsage(t *testing.T) {
+	testLeakIncreasesWithUsage(t, brokerTestConfig{
+		brokerType:     "postgres",
+		setupSleep:     500 * time.Millisecond,
+		receiveTimeout: 5 * time.Second,
 	})
 }
 

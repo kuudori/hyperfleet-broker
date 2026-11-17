@@ -4,13 +4,16 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cloudevents/sdk-go/v2/event"
+	"github.com/jackc/pgx/v5"
 	"github.com/openshift-hyperfleet/hyperfleet-broker/broker"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
@@ -20,6 +23,7 @@ import (
 const (
 	brokerTypeRabbitMQ     = "rabbitmq"
 	brokerTypeGooglePubSub = "googlepubsub"
+	brokerTypePostgres     = "postgres"
 )
 
 // NewTestLogger returns a *slog.Logger for integration tests.
@@ -106,6 +110,34 @@ func BuildConfigMap(brokerType string, rabbitMQURL string, pubsubProjectID strin
 		configMap["broker.googlepubsub.create_subscription_if_missing"] = "true"
 	}
 	return configMap
+}
+
+// BuildPostgresConfigMap creates a configuration map for the postgres
+// broker type from a URI-form DSN, decomposed into the discrete connection
+// fields the backend assembles into its own DSN.
+func BuildPostgresConfigMap(dsn string) map[string]string {
+	pgCfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		panic(fmt.Sprintf("invalid postgres DSN: %v", err))
+	}
+	// pgx consumes sslmode while parsing (it never appears in
+	// RuntimeParams), so read the requested mode from the URI itself.
+	sslmode := "disable"
+	if u, uriErr := url.Parse(dsn); uriErr == nil {
+		if m := u.Query().Get("sslmode"); m != "" {
+			sslmode = m
+		}
+	}
+	return map[string]string{
+		"broker.type":              brokerTypePostgres,
+		"subscriber.parallelism":   "1",
+		"broker.postgres.host":     pgCfg.Host,
+		"broker.postgres.port":     strconv.Itoa(int(pgCfg.Port)),
+		"broker.postgres.database": pgCfg.Database,
+		"broker.postgres.user":     pgCfg.User,
+		"broker.postgres.password": pgCfg.Password,
+		"broker.postgres.sslmode":  sslmode,
+	}
 }
 
 // RunPublisherSubscriber tests the full publish/subscribe flow
