@@ -34,7 +34,9 @@ func TestMigrateEventStoreRejectsInvalidInput(t *testing.T) {
 			name:   "invalid postgres config",
 			logger: discardLogger,
 			configMap: map[string]string{
-				"broker.type":              "postgres",
+				"broker.type": "postgres",
+				// Explicit, so BROKER_POSTGRES_HOST cannot supply a host.
+				"broker.postgres.host":     "",
 				"broker.postgres.database": "event_store",
 				"broker.postgres.user":     "event_store_migrate",
 				"broker.postgres.sslmode":  "disable",

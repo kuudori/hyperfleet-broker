@@ -110,8 +110,24 @@ func newEventStoreDatabase(t *testing.T, db string, precreateSchema bool, adminS
 	admin, err := connectAs(ctx, "", "")
 	require.NoError(t, err)
 	defer testutil.CloseConn(admin)
-	_, err = admin.Exec(ctx, `CREATE DATABASE `+pgx.Identifier{db}.Sanitize())
+	dbIdent := pgx.Identifier{db}.Sanitize()
+	_, err = admin.Exec(ctx, `CREATE DATABASE `+dbIdent)
 	require.NoError(t, err)
+	// Drop the database after the test, so a repeated run (-count) can
+	// create it again. FORCE ends connections a failed test left open.
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cleanupCancel()
+		conn, connErr := connectAs(cleanupCtx, "", "")
+		if connErr != nil {
+			t.Errorf("drop database %s: %v", db, connErr)
+			return
+		}
+		defer testutil.CloseConn(conn)
+		if _, dropErr := conn.Exec(cleanupCtx, `DROP DATABASE IF EXISTS `+dbIdent+` WITH (FORCE)`); dropErr != nil {
+			t.Errorf("drop database %s: %v", db, dropErr)
+		}
+	})
 	for _, stmt := range adminSettings {
 		_, err = admin.Exec(ctx, stmt)
 		require.NoError(t, err)
