@@ -351,6 +351,8 @@ Behavior settings:
 - It applies pending migrations in one `READ COMMITTED` transaction under a PostgreSQL advisory lock. Concurrent runs serialize, and a rerun changes nothing.
 - It records applied versions in `event_store.broker_schema_migrations`.
 
+`example/cmd/migrate` and `example/postgres/` show the full sequence.
+
 Before the first run the platform admin provisions the database:
 
 ```sql
@@ -703,7 +705,7 @@ Navigate to the PostgreSQL example directory:
 cd example/postgres
 ```
 
-Start all services (PostgreSQL with the event log schema applied, publisher, and two subscribers):
+Start all services: PostgreSQL with the event_store roles, the `migrate` service that applies the event_store migrations, the `maintenance-routine` service that installs the maintenance routine and creates the first partitions, the publisher, and two subscribers.
 
 ```bash
 docker-compose up -d
@@ -726,8 +728,8 @@ docker-compose logs -f subscriber2
 Observe consumer lag directly in SQL:
 
 ```bash
-docker-compose exec postgres psql -U broker -d broker -c \
-  "SELECT c.topic, c.subscription_id, s.next - 1 - c.acked AS lag FROM broker_cursors c JOIN broker_topic_seq s ON s.topic = c.topic;"
+docker-compose exec postgres psql -U broker -d event_store -c \
+  "SELECT c.topic, c.subscription_id, s.next - 1 - c.acked AS lag FROM event_store.broker_cursors c JOIN event_store.broker_topic_seq s ON s.topic = c.topic;"
 ```
 
 Stop services:
@@ -739,7 +741,7 @@ docker-compose down -v
 **What it demonstrates:**
 - Publisher publishes CloudEvents to `example-topic` at a fixed interval
 - Two subscribers with the same subscription ID reserve disjoint sequence ranges (load balancing)
-- The event log schema (tables, index, and maintenance routine) is applied by the container's init scripts on first start; the backend itself creates no schema
+- The `migrate` service applies the event_store migrations as `event_store_migrate` before the application services start, the way a deployment's init container does; the backend itself creates no schema
 - Consumer lag is observable in one SQL query
 
 </details>
